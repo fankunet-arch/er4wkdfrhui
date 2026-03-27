@@ -3,6 +3,9 @@ import re
 import glob
 import pandas as pd
 import datetime
+import os
+import time
+from deep_translator import GoogleTranslator
 
 def parse_mercadona_pdf(filepath):
     items = []
@@ -45,7 +48,6 @@ def parse_mercadona_pdf(filepath):
                     cuota_iva = parse_number(mercadona_match.group(6))
                     importe = parse_number(mercadona_match.group(7))
 
-                    # Compute con IVA unit price
                     p_unit_con_iva = importe / qty if qty > 0 else 0
 
                     items.append({
@@ -53,7 +55,6 @@ def parse_mercadona_pdf(filepath):
                         '发票号码': current_factura,
                         '日期': current_date,
                         '原始名称': desc,
-                        '中文名称': '',
                         '数量': qty,
                         '单价金额 (sin IVA)': p_unit,
                         '单品总计金额 (sin IVA)': b_imp,
@@ -86,7 +87,6 @@ def parse_makro_excel(filepath):
         if hasattr(row.get('Fecha Factura'), 'strftime'):
             date = row['Fecha Factura'].strftime('%d/%m/%Y')
         else:
-            # Handle standard formatting for makro date if string
             date = date.replace('-', '/')
 
         p_unit_con_iva = total_con_iva / qty if qty > 0 else 0
@@ -96,7 +96,6 @@ def parse_makro_excel(filepath):
             '发票号码': str(row.get('Nº Factura', '')).strip(),
             '日期': date,
             '原始名称': desc,
-            '中文名称': '',
             '数量': qty,
             '单价金额 (sin IVA)': p_unit_sin_iva,
             '单品总计金额 (sin IVA)': total_sin_iva,
@@ -105,6 +104,30 @@ def parse_makro_excel(filepath):
             '单品总计金额 (con IVA)': total_con_iva
         })
     return items
+
+def translate_descriptions(unique_desc):
+    translations = {}
+
+    print(f"Translating {len(unique_desc)} unique descriptions...")
+    # Cache translator to avoid recreating it
+    translator = GoogleTranslator(source='es', target='zh-CN')
+    for i, desc in enumerate(unique_desc):
+        if not desc:
+            translations[desc] = ""
+            continue
+
+        try:
+            translated = translator.translate(desc)
+            translations[desc] = translated
+        except Exception as e:
+            print(f"Error translating '{desc}': {e}")
+            translations[desc] = desc # Fallback to original
+            time.sleep(1) # Extra delay on error
+
+        if (i+1) % 50 == 0:
+            print(f"Translated {i+1}/{len(unique_desc)} items...")
+
+    return translations
 
 def main():
     all_items = []
@@ -116,21 +139,25 @@ def main():
         all_items.extend(parse_makro_excel(f))
 
     df = pd.DataFrame(all_items)
+    print(f"Parsed {len(df)} total items.")
 
-    # Calculate month from date
     def extract_month(date_str):
         if not date_str: return ''
-        # Assume date format could be DD/MM/YYYY or similar based on parsing output
-        # E.g. 31/01/2025 or 02-10-2025
         date_str = date_str.replace('-', '/')
         parts = date_str.split('/')
-        if len(parts) >= 2:
+        if len(parts) >= 3:
             return f"{parts[2]}-{parts[1]}" if len(parts[2]) == 4 else f"20{parts[2][-2:]}-{parts[1]}"
+        elif len(parts) == 2:
+            return f"{parts[1]}-{parts[0]}"
         return date_str
 
     df['月份'] = df['日期'].apply(extract_month)
 
-    # Reorder columns
+    unique_desc = df['原始名称'].unique()
+    translations = translate_descriptions(unique_desc)
+
+    df['中文名称'] = df['原始名称'].map(translations)
+
     columns_order = [
         '商家', '月份', '日期', '发票号码', '原始名称', '中文名称', '数量',
         '单价金额 (sin IVA)', '单品总计金额 (sin IVA)', 'IVA税率',
@@ -138,9 +165,27 @@ def main():
     ]
     df = df[columns_order]
 
+    agg_df = df.groupby(['商家', '月份', '中文名称', '原始名称']).agg({
+        '数量': 'sum',
+        '单品总计金额 (sin IVA)': 'sum',
+        '单品总计金额 (con IVA)': 'sum'
+    }).reset_index()
+
+    agg_df = agg_df.rename(columns={
+        '数量': '总用量 (数量)',
+        '单品总计金额 (sin IVA)': '总计金额 (sin IVA)',
+        '单品总计金额 (con IVA)': '总计金额 (con IVA)'
+    })
+
+    agg_df = agg_df.sort_values(by=['商家', '月份', '总计金额 (con IVA)'], ascending=[True, True, False])
+
     output_file = '订货统计.xlsx'
-    df.to_excel(output_file, index=False)
-    print(f"Data successfully exported to {output_file} ({len(df)} records)")
+
+    with pd.ExcelWriter(output_file) as writer:
+        df.to_excel(writer, sheet_name='详细列表 (Detailed List)', index=False)
+        agg_df.to_excel(writer, sheet_name='用量与总计统计 (Usage & Totals)', index=False)
+
+    print(f"Data successfully exported to {output_file} ({len(df)} detailed records, {len(agg_df)} aggregated records)")
 
 if __name__ == "__main__":
     main()
