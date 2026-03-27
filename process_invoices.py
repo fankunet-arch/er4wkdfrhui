@@ -7,6 +7,45 @@ import os
 import time
 from deep_translator import GoogleTranslator
 
+def categorize_item(desc):
+    desc_upper = desc.upper()
+
+    # Salmon categorization based on rules
+    if 'SALMON' in desc_upper:
+        if '7-8' in desc_upper:
+            return '三文鱼 7-8kg'
+        elif '5-6' in desc_upper:
+            return '三文鱼 5-6kg'
+        elif '8-9' in desc_upper:
+            return '三文鱼 8-9kg'
+        else:
+            return '三文鱼 (其他)'
+
+    # Chicken / Pollo / Gallina categorization
+    if 'MEDIA GALLINA' in desc_upper:
+        return '半只母鸡'
+    elif 'GALLINA' in desc_upper:
+        return '母鸡'
+
+    if 'ALBÓNDIGAS POLLO' in desc_upper or 'ALBONDIGAS POLLO' in desc_upper:
+        return '鸡肉丸'
+
+    if 'ALAS' in desc_upper or 'ALITA' in desc_upper or 'ALON' in desc_upper or 'ALÓN' in desc_upper:
+        if 'POLLO' in desc_upper or 'CONG' in desc_upper or 'PARTIDAS' in desc_upper:
+            return '鸡翅'
+
+    if 'PATAS POLLO' in desc_upper or 'PATAS DE POLLO' in desc_upper:
+        return '鸡爪'
+
+    if 'CONTRAMUSLO' in desc_upper:
+        return '去骨鸡腿肉 (Contramuslo)'
+
+    if 'PECHUGA' in desc_upper:
+        return '鸡胸肉 (Pechuga)'
+
+    # If no specific rule matched, return a generic translated placeholder or None
+    return None
+
 def parse_mercadona_pdf(filepath):
     items = []
     current_date = None
@@ -107,9 +146,7 @@ def parse_makro_excel(filepath):
 
 def translate_descriptions(unique_desc):
     translations = {}
-
     print(f"Translating {len(unique_desc)} unique descriptions...")
-    # Cache translator to avoid recreating it
     translator = GoogleTranslator(source='es', target='zh-CN')
     for i, desc in enumerate(unique_desc):
         if not desc:
@@ -135,7 +172,7 @@ def main():
     for f in glob.glob('fk/*.pdf'):
         all_items.extend(parse_mercadona_pdf(f))
 
-    for f in glob.glob('fk/*.ods'):
+    for f in glob.glob('fk/*.ods') + glob.glob('fk/*.xlsx') + glob.glob('fk/*.xls'):
         all_items.extend(parse_makro_excel(f))
 
     df = pd.DataFrame(all_items)
@@ -153,19 +190,34 @@ def main():
 
     df['月份'] = df['日期'].apply(extract_month)
 
-    unique_desc = df['原始名称'].unique()
-    translations = translate_descriptions(unique_desc)
+    # 1. Apply rules to map specific items to the requested '产品分类' (Product Category)
+    df['产品分类 (手工规则)'] = df['原始名称'].apply(categorize_item)
 
+    # 2. For items that didn't match our rules, we still translate the '原始名称' to '中文名称'
+    # to serve as a generic product name
+    uncategorized = df[df['产品分类 (手工规则)'].isnull()]['原始名称'].unique()
+    translations = translate_descriptions(uncategorized)
+
+    # Populate 中文名称 with the translation
     df['中文名称'] = df['原始名称'].map(translations)
 
+    # Now set final 产品 (Product) column:
+    # If it was matched by our rule, use the rule's result.
+    # Otherwise, use the automated translation.
+    df['产品 (统一分类)'] = df['产品分类 (手工规则)'].fillna(df['中文名称'])
+
+    # Also populate 中文名称 for the manually categorized ones so it's not empty
+    df['中文名称'] = df['中文名称'].fillna(df['产品 (统一分类)'])
+
     columns_order = [
-        '商家', '月份', '日期', '发票号码', '原始名称', '中文名称', '数量',
+        '商家', '月份', '日期', '发票号码', '产品 (统一分类)', '原始名称', '中文名称', '数量',
         '单价金额 (sin IVA)', '单品总计金额 (sin IVA)', 'IVA税率',
         '单价金额 (con IVA)', '单品总计金额 (con IVA)'
     ]
     df = df[columns_order]
 
-    agg_df = df.groupby(['商家', '月份', '中文名称', '原始名称']).agg({
+    # Aggregate by Month, Merchant, and the Unified Product Category
+    agg_df = df.groupby(['商家', '月份', '产品 (统一分类)']).agg({
         '数量': 'sum',
         '单品总计金额 (sin IVA)': 'sum',
         '单品总计金额 (con IVA)': 'sum'
